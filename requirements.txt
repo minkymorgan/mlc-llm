@@ -1,0 +1,13 @@
+argparse
+numpy
+typing-extensions
+pytest
+decorator
+scipy
+psutil
+attrs
+transformers
+
+torch
+torchvision
+torchaudio
