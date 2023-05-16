@@ -44,32 +44,27 @@ quantization_dict = {
     ),
 }
 
+supported_model_types = set(["llama", "gpt_neox", "moss"])
 
 def argparse_add_common(args: argparse.ArgumentParser) -> None:
-    args.add_argument(
-        "--model",
-        type=str,
-        default="vicuna-v1-7b",
-        choices=[
-            "vicuna-v1-7b",
-            "dolly-v2-3b",
-            "dolly-v2-7b",
-            "dolly-v2-12b",
-            "stablelm-tuned-alpha-3b",
-            "stablelm-tuned-alpha-7b",
-            "RedPajama-INCITE-Base-3B-v1",
-            "RedPajama-INCITE-Chat-3B-v1",
-            "RedPajama-INCITE-Instruct-3B-v1",
-            "moss-moon-003-sft",
-        ],
-    )
     args.add_argument(
         "--quantization",
         type=str,
         choices=[*quantization_dict.keys()],
-        default=[list(quantization_dict.keys())[0]],
+        default=list(quantization_dict.keys())[0],
     )
-
+    args.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Custom model path that contains params, tokenizer, and config"
+    )
+    args.add_argument(
+        "--hf-path",
+        type=str,
+        default=None,
+        help="Hugging Face path from which to download params, tokenizer, and config from"
+    )
 
 def argparse_postproc_common(args: argparse.Namespace) -> None:
     if hasattr(args, "device_name"):
@@ -238,6 +233,7 @@ def parse_target(args: argparse.Namespace) -> None:
         )
         args.target_kind = "webgpu"
         args.lib_format = "wasm"
+        args.system_lib = True
     elif args.target.startswith("iphone"):
         from tvm.contrib import cc, xcode  # pylint: disable=import-outside-toplevel
 

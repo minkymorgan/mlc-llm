@@ -1,7 +1,9 @@
 import argparse
 import os
 import pickle
+import json
 from typing import List
+import json
 
 import tvm
 import tvm.testing
@@ -44,17 +46,52 @@ def _parse_args():
     parsed = args.parse_args()
     assert parsed.max_seq_len == -1 or parsed.max_seq_len > 0
 
-    parsed.model_path = os.path.join(parsed.artifact_path, "models", parsed.model)
     parsed.export_kwargs = {}
     parsed.lib_format = "so"
+
+    parsed = _setup_model_path(parsed)
+
     parsed.db_path = parsed.db_path or os.path.join("log_db", parsed.model)
+
     utils.parse_target(parsed)
     utils.argparse_postproc_common(parsed)
+
     parsed.artifact_path = os.path.join(
         parsed.artifact_path, f"{parsed.model}-{parsed.quantization.name}"
     )
+
     return parsed
 
+def _setup_model_path(args):
+    if args.model_path and args.hf_path:
+        assert (args.model_path and not args.hf_path) or (args.hf_path and not args.model_path), "You cannot specify both a model path and a HF path. Please select one to specify."
+    if args.model_path:
+        validate_config(args)
+        with open(os.path.join(args.model_path, "config.json")) as f:
+            config = json.load(f)
+            args.model = config["_name_or_path"].split("/")[-1]
+    elif args.hf_path:
+        args.model = args.hf_path.split("/")[-1]
+        args.model_path = os.path.join(args.artifact_path, "models", args.model)
+        if os.path.exists(args.model_path):
+            print(f"Weights exist at {args.model_path}, skipping download.")
+        else:
+            os.makedirs(args.model_path, exist_ok=True)
+            os.system("git lfs install")
+            os.system(f"git clone https://huggingface.co/{args.hf_path} {args.model_path}")
+            print(f"Downloaded weights to {args.model_path}")
+        validate_config(args)
+    else:
+        raise ValueError(f"Please specify either the model_path or the hf_path.")
+    print(f"Using model path {args.model_path}")
+    return args
+
+def validate_config(args):
+    assert os.path.exists(os.path.join(args.model_path, "config.json")), "Model path must contain valid config file."
+    with open(os.path.join(args.model_path, "config.json")) as f:
+        config = json.load(f)
+        assert ("model_type" in config) and ("_name_or_path" in config), "Invalid config format."
+        assert config["model_type"] in utils.supported_model_types, f"Model type {config['model_type']} not supported."
 
 def debug_dump_script(mod, name, args):
     """Debug dump mode"""
@@ -130,6 +167,22 @@ def mod_transform_before_build(
     return mod_deploy
 
 
+def dump_default_mlc_llm_config(args):
+    config = dict()
+    config["model_lib"] = f"{args.model}-{args.quantization.name}"
+    config["local_id"] = f"{args.model}-{args.quantization.name}"
+    config["conv_template"] = args.conv_template
+    config["temperature"] = 0.7
+    config["top_p"] = 0.95
+    config["stream_interval"] = 2
+    config["mean_gen_len"] = 128
+    config["shift_fill_factor"] = 0.3
+    dump_path = os.path.join(args.artifact_path, "mlc_llm_config.json")
+    with open(dump_path, "w") as outfile:
+        json.dump(config, outfile, indent=4)
+    print(f"Finish exporting mlc_llm_config to {dump_path}")
+
+
 def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
     target_kind = args.target_kind
     debug_dump_script(mod_deploy, "mod_before_build.py", args)
@@ -195,27 +248,33 @@ if __name__ == "__main__":
         ARGS.artifact_path, f"mod_cache_before_build_{ARGS.target_kind}.pkl"
     )
     use_cache = ARGS.use_cache and os.path.isfile(cache_path)
-    if not use_cache:
-        if ARGS.model_category == "llama":
-            mod, params = llama.get_model(ARGS)
-        elif ARGS.model_category == "gpt_neox":
-            mod, params = gpt_neox.get_model(
-                ARGS.model, ARGS.model_path, ARGS.quantization.model_dtype
-            )
-        elif ARGS.model_category == "moss":
-            mod, params = moss.get_model(ARGS)
+    with open(os.path.join(ARGS.model_path, "config.json")) as f:
+        config = json.load(f)
+        if not use_cache:
+            if ARGS.model_category == "llama":
+                mod, params = llama.get_model(ARGS, config)
+            elif ARGS.model_category == "gpt_neox":
+                mod, params = gpt_neox.get_model(
+                    ARGS.model,
+                    ARGS.model_path,
+                    ARGS.quantization.model_dtype,
+                    config
+                )
+            elif ARGS.model_category == "moss":
+                mod, params = moss.get_model(ARGS, config)
+            else:
+                raise ValueError(f"Model {ARGS.model} not supported")
+            mod = mod_transform_before_build(mod, params, ARGS)
+            with open(cache_path, "wb") as outfile:
+                pickle.dump(mod, outfile)
+            print(f"Save a cached module to {cache_path}.")
+            utils.copy_tokenizer(ARGS)
         else:
-            raise ValueError(f"Model {ARGS.model} not supported")
-        mod = mod_transform_before_build(mod, params, ARGS)
-        with open(cache_path, "wb") as outfile:
-            pickle.dump(mod, outfile)
-        print(f"Save a cached module to {cache_path}.")
-        utils.copy_tokenizer(ARGS)
-    else:
-        print(
-            f"Load cached module from {cache_path} and skip tracing. "
-            "You can use --use-cache=0 to retrace"
-        )
-        mod = pickle.load(open(cache_path, "rb"))
-    dump_split_tir(mod)
-    build(mod, ARGS)
+            print(
+                f"Load cached module from {cache_path} and skip tracing. "
+                "You can use --use-cache=0 to retrace"
+            )
+            mod = pickle.load(open(cache_path, "rb"))
+        dump_split_tir(mod)
+        build(mod, ARGS)
+        dump_default_mlc_llm_config(ARGS)
